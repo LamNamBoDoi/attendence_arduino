@@ -3,180 +3,204 @@
 #include <MFRC522.h>
 #include <ESP32Servo.h>
 #include <LiquidCrystal_I2C.h>
-#include <time.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
 
+// ==== Cấu hình LCD I2C ====
 int lcdColumns = 16;
 int lcdRows = 2;
-
 LiquidCrystal_I2C lcd(0x27, lcdColumns, lcdRows);
+
+// ==== Cấu hình RFID ====
 #define SS_PIN 5
 #define RST_PIN 4
-#define PIN_SG90 27
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+// ==== Cấu hình LED, Buzzer ====
+// #define PIN_SG90 14
 const int buzzer = 13;
 const int ledPin = 12;
+// Servo sg90;
 
-MFRC522 rfid(SS_PIN, RST_PIN);
-MFRC522::MIFARE_Key key;
-
-Servo sg90;
-
+// ==== Cấu hình WiFi và Server ====
 const char *ssid = "Po";
 const char *password = "29120303";
-const char* device_token  = "8f19e31055c56b05";
-unsigned long previousMillis1 = 0;
-unsigned long previousMillis2 = 0;
-int timezone = 7 * 3600;   //Replace "x" your timezone.
-int time_dst = 0;
-String getData, Link;
-String OldCardID = "";
-String URL = "http://192.168.229.201/webdiemdanh/getdata.php";
+const char *device_token = "8f19e31055c56b05";
+String URL = "http://192.168.33.201/webdiemdanh/getdata.php";
 
-//********************connect to the WiFi******************
-void connectToWiFi(){
-    WiFi.mode(WIFI_OFF);        //Prevents reconnection issue (taking too long to connect)
-    delay(1000);
-    WiFi.mode(WIFI_STA);
-    Serial.print("Connecting to ");
-    Serial.println(ssid);
-    WiFi.begin(ssid, password);
-    
-    while (WiFi.status() != WL_CONNECTED) {
-      delay(500);
-      Serial.print(".");
-    }
-    Serial.println("");
-    Serial.println("Connected");
-    
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());  //IP address assigned to your ESP
-    
-    delay(1000);
-}
+// ==== FreeRTOS Queue ====
+QueueHandle_t cardQueue;
+QueueHandle_t lcdQueue;
 
-void ledandbuzzer()
-{
-    digitalWrite(buzzer, HIGH);
-    digitalWrite(ledPin, HIGH);  // Bật đèn LED
-    // sg90.write(180);
+// ==== Cấu trúc tin nhắn cho LCD ====
+typedef struct {
+  String line1;
+  String line2;
+} LCDMessage;
+
+// ==== Hàm kết nối WiFi ====
+void connectToWiFi() {
+  WiFi.mode(WIFI_OFF);
+  delay(1000);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  while (WiFi.status() != WL_CONNECTED) {
     delay(500);
-    digitalWrite(ledPin, LOW);   // Tắt đèn LED
-    digitalWrite(buzzer, LOW);
-    // sg90.write(0);  
+    Serial.print(".");
+  }
+  Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
 }
 
-void SendCardID( String Card_uid ){
-  Serial.println("Sending the Card ID");
-    ledandbuzzer();
-  if(WiFi.isConnected()){
-    HTTPClient http;    
-    getData = "?card_uid=" + String(Card_uid) + "&device_token=" + String(device_token); 
-    Link = URL + getData;
-    http.begin(Link); 
-    int httpCode = http.GET(); 
-    String payload = http.getString(); 
-    Serial.println("Link: " + Link);   //Print HTTP return code
-    Serial.println("httpCode: " + String(httpCode));   //Print HTTP return code
-    Serial.println("Card_id: " + Card_uid);     //Print Card ID
-    Serial.println("payload: " + String(payload));    //Print request response payload
+// ==== Task: đọc RFID ====
+// Cho phép quét lại cùng thẻ sau 3 giây
+void RFIDTask(void *pvParameters) {
+  String oldCard = "";
+  unsigned long lastCardTime = 0;
 
-    if (httpCode == 200) {
-      if (payload.substring(0, 5) == "login") {
-        String user_name = payload.substring(5);
-         Serial.println(user_name);
-         lcd.clear();
-          lcd.setCursor(0,0);
-          lcd.print("LOGIN");
-          lcd.setCursor(0,1);
-          lcd.print(user_name);
-      }
-      else if (payload.substring(0, 6) == "logout") {
-        String user_name = payload.substring(6);
-          Serial.println(user_name);
-          lcd.clear();
-          lcd.setCursor(0,0);
-          lcd.print("LOGOUT");
-          lcd.setCursor(0,1);
-          lcd.print(user_name);
+  for (;;) {
+    if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
+      vTaskDelay(200 / portTICK_PERIOD_MS);
+      continue;
+    }
 
+    String cardID = "";
+    for (byte i = 0; i < rfid.uid.size; i++) {
+      cardID += String(rfid.uid.uidByte[i]);
+    }
+
+    unsigned long now = millis();
+    Serial.println(now);
+    if (cardID != oldCard || (now - lastCardTime > 3000)) {
+      oldCard = cardID;
+      lastCardTime = now;
+      // portMAX_DELAY: chờ không giới hạn
+      xQueueSend(cardQueue, &cardID, portMAX_DELAY);
+    }
+    // hủy bỏ phiên làm việc
+    rfid.PICC_HaltA();
+  }
+}
+
+// ==== Task: gửi ID đến server và phản hồi LCD, hiệu ứng ==== 
+void SenderTask(void *pvParameters) {
+  String cardID;
+  LCDMessage msg;
+
+  for (;;) {
+    // xQueueReceive: chờ cho đến khi có dữ liệu trong hàng đợi
+    if (xQueueReceive(cardQueue, &cardID, portMAX_DELAY)) {
+      if (!WiFi.isConnected()) connectToWiFi();
+      // tạo link liên kết đến server
+      HTTPClient http;
+      String getData = "?card_uid=" + cardID + "&device_token=" + device_token;
+      String link = URL + getData;
+      Serial.println(link);
+      http.begin(link);
+      int httpCode = http.GET();
+      String payload = http.getString();
+      http.end();
+
+      Serial.println(httpCode);
+      Serial.println(payload);
+
+      // Gửi nội dung phù hợp cho LCD
+      if (httpCode == 200) {
+        if (payload.startsWith("login")) {
+          msg.line1 = "Welcome!";
+          msg.line2 = payload.substring(5);  // Tên người dùng
+          // sg90.write(90);  // mở cửa
+        } else if (payload.startsWith("logout")) {
+          msg.line1 = "Goodbye!";
+          msg.line2 = payload.substring(6);
+          // sg90.write(0);   // đóng lại
+        } else if (payload == "succesful") {
+          msg.line1 = "New card added!";
+          msg.line2 = "";
+        } else if (payload == "available") {
+          msg.line1 = "Card exists!";
+          msg.line2 = "";
+        } else {
+          msg.line1 = "Unknown card!";
+          msg.line2 = "";
+        }
+      } else {
+        msg.line1 = "HTTP ERROR";
+        msg.line2 = String(httpCode);
       }
-      else if (payload == "succesful") {
-          lcd.clear();
-          lcd.setCursor(0,0);
-          lcd.print("NEW CARD");
-      }
-      else if (payload == "available") {
-          lcd.clear();
-          lcd.setCursor(0,0);
-          lcd.print("OLD CARD");
-      }else{
-          lcd.clear();
-          lcd.setCursor(0,0);
-          lcd.print("UNDEFINED");
-      }
-      delay(100);
-      http.end();  //Close connection
-    }else{
-            lcd.clear();
-            lcd.setCursor(0,0);
-            lcd.print(httpCode);
-            Serial.println("HTTP GET Failed");
-            Serial.print("Error: ");
-            Serial.println(http.errorToString(httpCode));
+
+      // Gửi nội dung ra LCD
+      xQueueSend(lcdQueue, &msg, portMAX_DELAY);
+
+      // Buzzer + LED
+      digitalWrite(buzzer, HIGH);
+      digitalWrite(ledPin, HIGH);
+      delay(200);
+      digitalWrite(buzzer, LOW);
+      digitalWrite(ledPin, LOW);
     }
   }
 }
 
-void setup()
-{
-    Serial.begin(9600);
-    connectToWiFi();
-    pinMode(buzzer, OUTPUT);
-    pinMode(ledPin, OUTPUT);
-    SPI.begin();
-    rfid.PCD_Init();
-    lcd.init();
-    lcd.backlight();
-    sg90.setPeriodHertz(50);         
-    sg90.attach(PIN_SG90, 500, 2400);
-    lcd.setCursor(0, 0); // Đặt con trỏ tại dòng 0, cột 0.
-    lcd.print("ATTENDANCE"); // In thông tin.
-    lcd.setCursor(9, 1);
-    lcd.print("SYSTEM");
+// ==== Task: Hiển thị LCD ====
+void LCDTask(void *pvParameters) {
+  LCDMessage msg;
+  for (;;) {
+    if (xQueueReceive(lcdQueue, &msg, portMAX_DELAY)) {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print(msg.line1);
+      lcd.setCursor(0, 1);
+      lcd.print(msg.line2);
+
+      // Hiển thị trong 3 giây
+      vTaskDelay(3000 / portTICK_PERIOD_MS);
+
+      // Quay về màn hình chính
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("ATTENDANCE");
+      lcd.setCursor(0, 1);
+      lcd.print("SYSTEM");
+    }
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+  }
 }
 
-void loop()
-{
-    if(!WiFi.isConnected()){
-        connectToWiFi();
-    }
-    if (millis() - previousMillis1 >= 1000) {
-        previousMillis1 = millis();
-        if (millis() - previousMillis2 >= 5000) {
-            previousMillis2 = millis();
-            OldCardID="";
-        }
-        delay(50);
-        // Kiểm tra xem có thẻ mới không
-        if (!rfid.PICC_IsNewCardPresent()) {
-            return; // Không có thẻ mới, thoát vòng lặp
-        }
+// ==== setup() ====
+void setup() {
+  Serial.begin(9600);
+  connectToWiFi();
 
-        // Đọc dữ liệu từ thẻ
-        if (!rfid.PICC_ReadCardSerial()) {
-            return; // Không đọc được thẻ, thoát vòng lặp
-        }
-        String CardID ="";
-        for (byte i = 0; i < rfid.uid.size; i++) {
-        CardID += rfid.uid.uidByte[i];
-        }
-        if( CardID == OldCardID ){
-            return;
-        }else{
-        OldCardID = CardID;
-        }
-        SendCardID(CardID);
-  }
+  // I/O
+  pinMode(buzzer, OUTPUT);
+  pinMode(ledPin, OUTPUT);
 
+  // RFID + LCD
+  SPI.begin();
+  rfid.PCD_Init();
+  lcd.init();
+  lcd.backlight();
+
+  // sg90.setPeriodHertz(50);
+  // sg90.attach(PIN_SG90, 500, 2400);
+  // sg90.write(0); 
+
+  lcd.setCursor(0, 0);
+  lcd.print("ATTENDANCE");
+  lcd.setCursor(0, 1);
+  lcd.print("SYSTEM");
+
+  // Tạo hàng đợi
+  cardQueue = xQueueCreate(5, sizeof(String));
+  lcdQueue = xQueueCreate(5, sizeof(LCDMessage));
+
+  // Tạo các task
+  xTaskCreatePinnedToCore(RFIDTask, "RFID Reader", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(SenderTask, "Sender", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(LCDTask, "LCD Display", 4096, NULL, 1, NULL, 1);
+}
+
+void loop() {
 }
